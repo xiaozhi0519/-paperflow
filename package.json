@@ -1,0 +1,61 @@
+{
+  "name": "paperflow",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:ai": "node --env-file-if-exists=.env server/ai-server.mjs",
+    "dev:server": "node --env-file-if-exists=.env server/server.mjs",
+    "db:migrate": "node --env-file-if-exists=.env server/migrate.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "generate:sample": "node scripts/generate-sample.mjs",
+    "test:browser": "node scripts/browser-test.mjs",
+    "test:library": "node scripts/library-test.mjs",
+    "test:backend": "node scripts/backend-test.mjs",
+    "test:remote-browser": "node scripts/remote-browser-test.mjs",
+    "test:ai-server": "node scripts/ai-server-test.mjs",
+    "test:ai-provider": "node --env-file-if-exists=.env scripts/ai-provider-check.mjs",
+    "test:ai-real": "node --env-file-if-exists=.env scripts/ai-real-browser-test.mjs",
+    "test:ai-browser": "node scripts/ai-browser-test.mjs",
+    "test:ai-integration": "node scripts/ai-integration-test.mjs",
+    "test:team": "node scripts/team-test.mjs",
+    "test:import-browser": "node scripts/import-browser-test.mjs",
+    "test:collaboration-browser": "node scripts/collaboration-browser-test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1172.0",
+    "@tailwindcss/vite": "^4.1.18",
+    "bcryptjs": "^3.0.3",
+    "connect-pg-simple": "^10.0.0",
+    "connect-sqlite3": "^0.9.18",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
+    "express-session": "^1.19.0",
+    "knex": "^3.3.0",
+    "lucide-react": "^0.468.0",
+    "multer": "^2.5.0",
+    "pdfjs-dist": "^5.4.624",
+    "pg": "^8.23.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.6",
+    "sqlite3": "^6.0.1",
+    "tailwindcss": "^4.1.18",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "pdf-lib": "^1.17.1",
+    "playwright-core": "^1.65.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.1"
+  }
+}
