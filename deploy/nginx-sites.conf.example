@@ -1,0 +1,45 @@
+# Include inside nginx http {}; replace host and certificate paths before use.
+log_format paperflow '$time_iso8601 $request_method $status $request_time';
+server {
+    listen 80;
+    server_name api.example.invalid;
+    if ($host != api.example.invalid) { return 444; }
+    return 308 https://api.example.invalid$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name api.example.invalid;
+    if ($host != api.example.invalid) { return 444; }
+    ssl_certificate /etc/paperflow/tls/fullchain.pem;
+    ssl_certificate_key /etc/paperflow/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    access_log /var/log/nginx/paperflow-access.log paperflow;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    client_max_body_size 21m;
+    client_body_timeout 60s;
+    location /api/ {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:8787;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Host "";
+        proxy_set_header Forwarded "";
+        proxy_set_header Authorization "";
+        proxy_set_header X-PaperFlow-Gateway-Token $http_x_paperflow_gateway_token;
+        proxy_read_timeout 70s;
+        proxy_send_timeout 70s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+    location = /health/ready {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host 127.0.0.1:8787;
+        proxy_read_timeout 12s;
+        proxy_cache off;
+    }
+    location / { return 404; }
+}

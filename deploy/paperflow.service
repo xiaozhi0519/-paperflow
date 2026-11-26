@@ -1,0 +1,26 @@
+[Unit]
+Description=PaperFlow API
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=paperflow
+Group=paperflow
+WorkingDirectory=/srv/paperflow/current
+EnvironmentFile=/etc/paperflow/production.env
+ExecStart=/usr/bin/node /srv/paperflow/current/server/start.mjs
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

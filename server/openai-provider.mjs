@@ -74,6 +74,86 @@ function responseMetadata(data, key) {
   return { model, modelStatus, usage, usageStatus }
 }
 
+export function safePreviewLength(text, key) {
+  if (text.includes(key)) throw new ProviderError('UNSAFE_RESPONSE', '模型返回内容包含敏感信息，已阻止显示。', 200)
+  // Hold possible credential prefixes until the next fragment rules out a match.
+  for (let size = Math.min(key.length - 1, text.length); size > 0; size--) {
+    if (text.endsWith(key.slice(0, size))) return text.length - size
+  }
+  return text.length
+}
+
+export async function streamChatCompletion(config, { messages, maxTokens = 1100, temperature = 0.1, signal, onDelta }) {
+  if (!config.configured) throw new ProviderError('NOT_CONFIGURED', '模型中转站尚未配置，请在服务端填写基础地址、模型名和密钥。')
+  const controller = new AbortController()
+  const requestSignal = AbortSignal.any([controller.signal, AbortSignal.timeout(config.timeout), ...(signal ? [signal] : [])])
+  try {
+    const response = await fetch(config.endpoint, {
+      method: 'POST', redirect: 'error', signal: requestSignal,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${config.key}` },
+      body: JSON.stringify({ model: config.model, temperature, max_tokens: maxTokens, stream: true, messages }),
+    })
+    if (!response.ok || !response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
+      const raw = await readResponse(response)
+      let data
+      try { data = JSON.parse(raw) } catch {}
+      if (!response.ok || data?.error) throw classifyError(response.status, data)
+      throw new ProviderError('STREAM_UNSUPPORTED', '模型中转站未返回兼容的流式响应，请选择其他模型或检查接口支持情况。', response.status)
+    }
+    if (!response.body) throw new ProviderError('INVALID_RESPONSE', '模型中转站返回了空响应。', response.status)
+    const decoder = new TextDecoder()
+    let buffer = '', eventData = [], content = '', emitted = 0, received = 0, done = false, finishReason = null
+    const metadata = {}
+    const dispatch = async () => {
+      if (!eventData.length) return
+      const value = eventData.join('\n')
+      eventData = []
+      if (value.trim() === '[DONE]') { done = true; return }
+      let event
+      try { event = JSON.parse(value) } catch { throw new ProviderError('INVALID_RESPONSE', '模型中转站返回的流式数据格式不正确。', response.status) }
+      if (!event || typeof event !== 'object' || Array.isArray(event)) throw new ProviderError('INVALID_RESPONSE', '模型中转站返回的流式数据格式不正确。', response.status)
+      if (event.error) throw classifyError(response.status, event)
+      if (event.model !== undefined) metadata.model = event.model
+      if (event.usage !== undefined && event.usage !== null) metadata.usage = event.usage
+      const choice = event.choices?.[0]
+      if (choice?.finish_reason) finishReason = choice.finish_reason
+      const delta = choice?.delta?.content
+      if (delta !== undefined && delta !== null) {
+        if (typeof delta !== 'string') throw new ProviderError('INVALID_RESPONSE', '模型中转站未返回兼容的文本内容。', response.status)
+        content += delta
+        if (content.length > 20000) throw new ProviderError('INVALID_RESPONSE', '模型中转站响应过长，无法安全处理。', response.status)
+        const safeEnd = safePreviewLength(content, config.key)
+        if (safeEnd > emitted) { await onDelta(content.slice(emitted, safeEnd)); emitted = safeEnd }
+      }
+    }
+    for await (const part of response.body) {
+      received += part.byteLength
+      if (received > MAX_RESPONSE_LENGTH) throw new ProviderError('INVALID_RESPONSE', '模型中转站响应过长，无法安全处理。', response.status)
+      buffer += decoder.decode(part, { stream: true })
+      let newline
+      while ((newline = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, newline).replace(/\r$/, '')
+        buffer = buffer.slice(newline + 1)
+        if (!line) await dispatch()
+        else if (line.startsWith('data:')) eventData.push(line.slice(5).replace(/^ /, ''))
+        if (done) break
+      }
+      if (done) break
+    }
+    if (!done) throw new ProviderError('INCOMPLETE_RESPONSE', '模型回答传输中断，未保存未完成内容，请手动重试。', response.status)
+    if (finishReason && finishReason !== 'stop') throw new ProviderError('INCOMPLETE_RESPONSE', '模型回答未完整生成，请缩小问题范围后重试。', response.status)
+    if (!content.trim()) throw new ProviderError('INVALID_RESPONSE', '模型中转站未返回兼容的非空文本内容。', response.status)
+    safePreviewLength(content, config.key)
+    if (emitted < content.length) await onDelta(content.slice(emitted))
+    return { content, ...responseMetadata(metadata, config.key) }
+  } catch (error) {
+    if (error instanceof ProviderError) throw error
+    if (signal?.aborted) throw new ProviderError('CANCELLED', '已停止生成。')
+    if (requestSignal.aborted) throw new ProviderError('TIMEOUT', '模型中转站请求超时，请检查服务状态或调整超时时间。')
+    throw new ProviderError('CONNECTION_FAILED', '无法连接模型中转站，请检查网络和服务端配置。')
+  } finally { controller.abort() }
+}
+
 export async function requestChatCompletion(config, { messages, maxTokens = 1100, temperature = 0.1 }) {
   if (!config.configured) throw new ProviderError('NOT_CONFIGURED', '模型中转站尚未配置，请在服务端填写基础地址、模型名和密钥。')
   try {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rename, rm } from 'node:fs/promises'
 import net from 'node:net'
 import http from 'node:http'
 import os from 'node:os'
@@ -11,7 +11,7 @@ import knex from 'knex'
 const dataDir = await mkdtemp(path.join(os.tmpdir(), 'paperflow-api-test-'))
 const port = await new Promise((resolve, reject) => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)) }); server.on('error', reject) })
 const origin = 'http://127.0.0.1:5173'
-const env = { ...process.env, NODE_ENV: 'development', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: '', AI_PORT: String(port), AI_ALLOWED_ORIGINS: origin, SESSION_SECRET: 'isolated-test-session-secret-long-enough' }
+const env = { ...process.env, NODE_ENV: 'development', DEPLOYMENT_MODE: 'same-origin', BIND_HOST: '127.0.0.1', ALLOWED_HOSTS: `127.0.0.1:${port},localhost:${port}`, TRUSTED_PROXIES: '', PG_SSL_CA_FILE: '', S3_FORCE_PATH_STYLE: '', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: '', AI_PORT: String(port), AI_ALLOWED_ORIGINS: origin, SESSION_SECRET: 'isolated-test-session-secret-long-enough' }
 const base = `http://127.0.0.1:${port}`
 let child
 let output = ''
@@ -49,6 +49,19 @@ function form(id, bytes, workspaceId = null, name = 'test.pdf') {
 }
 try {
   await start()
+  assert.equal((await call('/health/live')).data.status, 'live')
+  assert.equal((await call('/health/ready')).data.status, 'ready')
+  await rename(path.join(dataDir, 'pdf'), path.join(dataDir, 'pdf-offline'))
+  try { assert.equal((await call('/health/ready', { expected: 503 })).data.status, 'not_ready') }
+  finally { await rename(path.join(dataDir, 'pdf-offline'), path.join(dataDir, 'pdf')) }
+  assert.equal((await call('/api/health')).data.status, 'ready')
+  const malformed = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { origin, 'content-type': 'application/json' }, body: '{' })
+  assert.equal(malformed.status, 400)
+  const invalid = await malformed.json()
+  assert.match(invalid.requestId, /^[0-9a-f-]{36}$/)
+  assert.ok(!JSON.stringify(invalid).includes('SyntaxError'))
+  await call('/api/not-found', { expected: 404 })
+  console.log('本机真实服务：存活/就绪、私有文件目录暂不可用返回 503、恢复后 200、无堆栈 JSON 错误及请求 ID 通过。')
   const pdf = await readFile('public/paperflow-sample.pdf')
   const a = await call('/api/auth/register', { method: 'POST', body: { name: '账户甲', email: 'alpha@example.test', password: 'Test-password-123' }, expected: 201 })
   const b = await call('/api/auth/register', { method: 'POST', body: { name: '账户乙', email: 'beta@example.test', password: 'Test-password-456' }, expected: 201 })

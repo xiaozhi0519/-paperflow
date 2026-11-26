@@ -8,6 +8,15 @@
   },
   "scripts": {
     "dev": "vite",
+    "start": "node server/start.mjs",
+    "check:production": "node scripts/check-production-config.mjs",
+    "build:sites": "tsc --noEmit && vite build --mode sites",
+    "db:status": "node --env-file-if-exists=.env server/migrate.mjs --status",
+    "db:status:prod": "node server/migrate.mjs --production --status",
+    "db:migrate:prod": "node server/migrate.mjs --production --apply",
+    "test:migrations": "node scripts/migration-test.mjs",
+    "test:deployment": "node scripts/deployment-test.mjs",
+    "verify:deployment": "node scripts/verify-deployment.mjs",
     "dev:ai": "node --env-file-if-exists=.env server/ai-server.mjs",
     "dev:server": "node --env-file-if-exists=.env server/server.mjs",
     "db:migrate": "node --env-file-if-exists=.env server/migrate.mjs",
@@ -40,7 +49,7 @@
     "knex": "^3.3.0",
     "lucide-react": "^0.468.0",
     "multer": "^2.5.0",
-    "pdfjs-dist": "^5.4.624",
+    "pdfjs-dist": "6.2.108",
     "pg": "^8.23.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
@@ -48,6 +57,11 @@
     "sqlite3": "^6.0.1",
     "tailwindcss": "^4.1.18",
     "zod": "^4.6.7"
+  },
+  "overrides": {
+    "connect-sqlite3": {
+      "sqlite3": "$sqlite3"
+    }
   },
   "devDependencies": {
     "@types/react": "^19.2.7",

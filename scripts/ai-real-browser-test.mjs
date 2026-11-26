@@ -47,8 +47,15 @@ async function answer(page, action) {
   const noEvidence = page.getByText('未找到匹配的原文证据，无法从当前论文确认。').waitFor({ timeout: 160000 }).then(() => { throw new Error('问题未检索到证据，请改用论文中的关键词。') })
   await action()
   const result = await Promise.race([response, alert, noEvidence])
-  const data = await result.json()
-  if (!result.ok()) throw new Error(`${data.code || 'AI_ERROR'}：${data.error || '模型请求失败。'}`)
+  const raw = await result.text()
+  if (!result.ok()) { const data = JSON.parse(raw); throw new Error(`${data.code || 'AI_ERROR'}：${data.error || '模型请求失败。'}`) }
+  if (!result.headers()['content-type']?.startsWith('application/x-ndjson')) throw new Error('AI 接口未返回流式响应。')
+  const events = raw.trim().split('\n').map(line => JSON.parse(line))
+  const failure = events.find(event => event.type === 'error')
+  if (failure) throw new Error(`${failure.code || 'AI_ERROR'}：${failure.error || '模型请求失败。'}`)
+  const final = events.at(-1)
+  if (final?.type !== 'done') throw new Error('流式响应未完整结束。')
+  const data = final.result
   if (data.source !== 'model' || !Array.isArray(data.citations) || !data.citations.length) throw new Error('模型未返回可核验的论文引用，未将本地提示当作模型回答。')
   return data
 }
@@ -88,7 +95,8 @@ try {
   await page.locator('.pdf-page canvas').waitFor()
   await page.waitForFunction(() => !document.querySelector('.pdf-rendering'))
   await page.getByRole('tab', { name: 'AI 助手' }).click()
-  await page.getByText('模型已配置：', { exact: false }).waitFor()
+  await page.getByText('已选模型：', { exact: false }).waitFor()
+  await page.getByRole('combobox', { name: '选择 AI 模型' }).selectOption(config.model)
   const overview = await answer(page, () => page.getByRole('button', { name: '论文整体解读' }).click())
   await checkCitations(overview.citations)
   await page.locator('.ai-message--assistant').first().locator('.citation-card').first().waitFor()

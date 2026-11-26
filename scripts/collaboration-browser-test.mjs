@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,12 +10,23 @@ import { chromium } from 'playwright-core'
 const candidates = process.platform === 'win32' ? ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'] : process.platform === 'darwin' ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'] : ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']
 const executablePath = process.env.CHROME_PATH || candidates.find(existsSync)
 if (!executablePath) throw new Error('请设置 CHROME_PATH 指向已安装的 Chromium 浏览器。')
+const sites = process.env.PAPERFLOW_TEST_SITES === '1'
+const apiBase = sites ? '/functions/v1/app/api' : '/api'
+const preview = sites || process.env.PAPERFLOW_TEST_PREVIEW === '1'
+if (preview && !existsSync('dist/index.html')) throw new Error('请先运行 npm run build。')
+if (preview) {
+  const script = readFileSync('dist/index.html', 'utf8').match(/<script[^>]+src="([^"]+)"/)?.[1]
+  assert.ok(script)
+  const usesSites = readFileSync(path.join('dist', script.replace(/^\//, '')), 'utf8').includes('/functions/v1/app/api')
+  assert.equal(usesSites, sites, `构建模式不匹配，请先运行 npm run ${sites ? 'build:sites' : 'build'}。`)
+}
 const freePort = () => new Promise((resolve, reject) => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const port = server.address().port; server.close(() => resolve(port)) }); server.on('error', reject) })
 const webPort = await freePort()
 const apiPort = await freePort()
+const gatewayPort = await freePort()
 const base = `http://127.0.0.1:${webPort}`
 const dataDir = await mkdtemp(path.join(os.tmpdir(), 'paperflow-collaboration-'))
-const env = { ...process.env, NODE_ENV: 'development', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: '', AI_PORT: String(apiPort), AI_ALLOWED_ORIGINS: base, SESSION_SECRET: 'isolated-collaboration-test-session-secret' }
+const env = { ...process.env, NODE_ENV: 'development', DEPLOYMENT_MODE: sites ? 'sites' : 'same-origin', BIND_HOST: '127.0.0.1', ALLOWED_HOSTS: `127.0.0.1:${apiPort},localhost:${apiPort}`, TRUSTED_PROXIES: '', VITE_API_BASE_URL: apiBase, PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', PG_SSL_CA_FILE: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', S3_FORCE_PATH_STYLE: '', AI_BASE_URL: '', AI_MODEL: '', AI_API_KEY: '', AI_PORT: String(apiPort), AI_ALLOWED_ORIGINS: base, SESSION_SECRET: 'isolated-collaboration-test-session-secret', APP_ORIGIN: base, APP_API_ORIGIN: `http://127.0.0.1:${apiPort}`, APP_GATEWAY_TOKEN: 'isolated_gateway_test_token_012345678901234567890123456789', PAPERFLOW_GATEWAY_PORT: String(gatewayPort) }
 const children = []
 let output = ''
 function start(args, marker) {
@@ -44,7 +55,10 @@ let modelCalls = 0
 for (const page of [a, b]) {
   page.on('pageerror', error => errors.push(error.message))
   page.on('response', response => { if (response.status() >= 500) errors.push(`${response.status()} ${response.url()}`) })
-  page.on('request', request => { if (/\/api\/(ai\/answer|papers\/[^/]+\/discussion-summary)/.test(request.url())) modelCalls++ })
+  page.on('request', request => {
+    if (/\/api\/(ai\/answer|papers\/[^/]+\/discussion-summary)/.test(request.url())) modelCalls++
+    if (sites && new URL(request.url()).pathname.startsWith('/api/')) errors.push('Sites 构建绕过了 Function 网关')
+  })
 }
 const password = 'Collaboration-password-123'
 const renderReady = async page => { await page.locator('.textLayer span').first().waitFor({ state: 'attached', timeout: 30000 }); await page.waitForFunction(() => !document.querySelector('.pdf-rendering')) }
@@ -97,7 +111,14 @@ async function screenshot(page, name) {
 }
 try {
   await start(['server/server.mjs'], 'API listening')
-  await start(['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(webPort), '--strictPort'], `http://127.0.0.1:${webPort}`)
+  if (sites) await start(['scripts/gateway-local.mjs'], 'local gateway listening')
+  await start(['node_modules/vite/bin/vite.js', ...(preview ? ['preview'] : []), '--host', '127.0.0.1', '--port', String(webPort), '--strictPort'], `http://127.0.0.1:${webPort}`)
+  console.log(`浏览器验收模式：${preview ? '生产构建 + CSP' : 'Vite 开发服务器'}；${sites ? '本机 Function 处理器网关（非平台 SDK）' : '同源 /api 代理'}`)
+  if (preview) await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['scripts/verify-deployment.mjs', '--local'], { env: { ...env, PAPERFLOW_VERIFY_ORIGIN: base, PAPERFLOW_VERIFY_API_BASE: apiBase }, stdio: 'inherit' })
+    children.push(child)
+    child.on('error', reject); child.on('exit', code => code === 0 ? resolve() : reject(new Error(`部署只读验证失败：${code}`)))
+  })
   await Promise.all([register(a, '研究员甲', 'browser-a@example.test'), register(b, '研究员乙', 'browser-b@example.test')])
   await a.getByRole('button', { name: '创建空间', exact: true }).click()
   await a.getByRole('textbox', { name: '空间名称' }).fill('跨学科共读小组')
@@ -268,9 +289,9 @@ try {
   const outsider = await browser.newContext()
   const outsiderPage = await outsider.newPage()
   await outsiderPage.goto(base)
-  const anonymousStatus = await outsiderPage.evaluate(async teamId => (await fetch(`/api/knowledge?workspaceId=${teamId}`)).status, teamId)
+  const anonymousStatus = await outsiderPage.evaluate(async ({ teamId, apiBase }) => (await fetch(`${apiBase}/knowledge?workspaceId=${teamId}`)).status, { teamId, apiBase })
   assert.equal(anonymousStatus, 401)
-  const revokedStatuses = await b.evaluate(async ({ teamId, paperId }) => Promise.all([`/api/workspaces/${teamId}`, `/api/papers/${paperId}/file`, `/api/knowledge?workspaceId=${teamId}`].map(async url => (await fetch(url)).status)), { teamId, paperId })
+  const revokedStatuses = await b.evaluate(async ({ teamId, paperId, apiBase }) => Promise.all([`${apiBase}/workspaces/${teamId}`, `${apiBase}/papers/${paperId}/file`, `${apiBase}/knowledge?workspaceId=${teamId}`].map(async url => (await fetch(url)).status)), { teamId, paperId, apiBase })
   assert.deepEqual(revokedStatuses, [404, 404, 404])
   await outsider.close()
   console.log('浏览器内 API 只读断言（非 UI 操作）：未登录 401、退出后团队/PDF/知识库 404 通过。')

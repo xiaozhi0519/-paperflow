@@ -7,7 +7,7 @@ export async function importPaper(file: File, storage: LibraryStorage, workspace
   const header = new TextDecoder('ascii').decode(bytes.slice(0, 1024))
   if (!header.includes('%PDF-')) throw new Error('文件不是有效的 PDF，请重新选择。')
   const [{ getDocument }] = await Promise.all([import('pdfjs-dist'), import('../features/pdf/pdfConfig')])
-  const task = getDocument({ data: new Uint8Array(bytes) })
+  const task = getDocument({ data: new Uint8Array(bytes), enableXfa: false })
   let pageCount: number
   try {
     const document = await task.promise

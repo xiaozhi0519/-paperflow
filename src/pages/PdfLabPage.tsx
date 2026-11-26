@@ -53,7 +53,7 @@ export function PdfLabPage() {
         const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
         if (cancelled) return
         const key = `paperflow:pdf-anchors:v1:${hash}`
-        task = getDocument({ data: new Uint8Array(bytes) })
+        task = getDocument({ data: new Uint8Array(bytes), enableXfa: false })
         const pdf = await task.promise
         if (cancelled) return
         setStorageKey(key)

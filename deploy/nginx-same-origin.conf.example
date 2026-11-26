@@ -1,0 +1,50 @@
+# Alternative to nginx-sites.conf.example, not an additional public entry.
+log_format paperflow '$time_iso8601 $request_method $status $request_time';
+server {
+    listen 80;
+    server_name paperflow.example.invalid;
+    if ($host != paperflow.example.invalid) { return 444; }
+    return 308 https://paperflow.example.invalid$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name paperflow.example.invalid;
+    if ($host != paperflow.example.invalid) { return 444; }
+    ssl_certificate /etc/paperflow/tls/fullchain.pem;
+    ssl_certificate_key /etc/paperflow/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /srv/paperflow/current/dist;
+    access_log /var/log/nginx/paperflow-access.log paperflow;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Content-Security-Policy "frame-ancestors 'none'" always;
+    add_header Referrer-Policy no-referrer always;
+    client_max_body_size 21m;
+    client_body_timeout 60s;
+    location /api/ {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:8787;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Host "";
+        proxy_set_header Forwarded "";
+        proxy_set_header Authorization "";
+        proxy_set_header X-PaperFlow-Gateway-Token "";
+        proxy_read_timeout 70s;
+        proxy_send_timeout 70s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_cache off;
+    }
+    location /assets/ { try_files $uri =404; expires 1y; }
+    location ~* \.m?js$ {
+        types { application/javascript js mjs; }
+        try_files $uri =404;
+    }
+    location ~* \.(?:css|map|pdf|png|jpg|svg|woff2?)$ { try_files $uri =404; }
+    location = /index.html { expires -1; }
+    location /functions/ { return 404; }
+    location / { try_files $uri /index.html; }
+}

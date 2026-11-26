@@ -1,3 +1,5 @@
+import { apiUrl } from './api'
+
 export type SummarySourceType = 'paper-evidence' | 'member-opinion' | 'ai-inference'
 export interface SummaryItem {
   text: string
@@ -32,7 +34,7 @@ export interface SavedSummary {
 }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...init })
+  const response = await fetch(apiUrl(path), { credentials: 'same-origin', ...init })
   if (response.status === 401) window.dispatchEvent(new Event('paperflow:session-expired'))
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string }

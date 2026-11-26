@@ -38,7 +38,7 @@ fake.listen(0, '127.0.0.1')
 await new Promise(resolve => fake.once('listening', resolve))
 const fakePort = fake.address().port
 const origin = 'http://127.0.0.1:5173'
-const env = { ...process.env, NODE_ENV: 'development', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: 'team-test-key', AI_MODEL: 'stub-model', AI_BASE_URL: `http://127.0.0.1:${fakePort}/v1`, AI_PORT: String(port), AI_ALLOWED_ORIGINS: origin, SESSION_SECRET: 'isolated-team-test-session-secret-long-enough' }
+const env = { ...process.env, NODE_ENV: 'development', DEPLOYMENT_MODE: 'same-origin', BIND_HOST: '127.0.0.1', ALLOWED_HOSTS: `127.0.0.1:${port},localhost:${port}`, TRUSTED_PROXIES: '', PG_SSL_CA_FILE: '', S3_FORCE_PATH_STYLE: '', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: 'team-test-key', AI_MODEL: 'stub-model', AI_BASE_URL: `http://127.0.0.1:${fakePort}/v1`, AI_PORT: String(port), AI_ALLOWED_ORIGINS: origin, SESSION_SECRET: 'isolated-team-test-session-secret-long-enough' }
 const base = `http://127.0.0.1:${port}`
 let child
 let output = ''

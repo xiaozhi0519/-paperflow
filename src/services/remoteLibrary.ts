@@ -1,3 +1,4 @@
+import { apiUrl } from './api'
 import type { AiMessage, PaperChunk } from '../types/ai'
 import type { Annotation, LibraryItem, Note } from '../types/library'
 import type { LibraryStorage } from './libraryRepository'
@@ -7,7 +8,7 @@ const history = new Map<string, AiMessage[]>()
 export function clearRemoteCache() { chunks.clear(); history.clear() }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...init })
+  const response = await fetch(apiUrl(path), { credentials: 'same-origin', ...init })
   if (response.status === 401) window.dispatchEvent(new Event('paperflow:session-expired'))
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string }

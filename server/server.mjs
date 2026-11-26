@@ -11,39 +11,44 @@ import multer from 'multer'
 import { rateLimit } from 'express-rate-limit'
 import { z } from 'zod'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
-import { openDatabase, migrateDatabase } from './database.mjs'
+import { openDatabase, migrateDatabase, migrationStatus, postgresConnection } from './database.mjs'
+import { readServerConfig } from './config.mjs'
+import { installHttpSecurity, logEvent } from './http-security.mjs'
 import { createObjectStorage } from './object-storage.mjs'
 import { registerKnowledge } from './knowledge.mjs'
 import { handleAi } from './ai-server.mjs'
 import { ProviderError, readProviderConfig, requestChatCompletion } from './openai-provider.mjs'
 
 const env = process.env
-const portValue = Number(env.AI_PORT || 8787)
-const port = Number.isInteger(portValue) && portValue > 0 && portValue <= 65535 ? portValue : 8787
-const origins = new Set((env.AI_ALLOWED_ORIGINS || 'http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173').split(',').map(value => value.trim()).filter(Boolean))
-const production = env.NODE_ENV === 'production'
-if (production && (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)) throw new Error('生产模式需要至少 32 个字符的 SESSION_SECRET。')
+const config = readServerConfig(env)
+const { port, host, production } = config
 const secret = env.SESSION_SECRET || randomBytes(48).toString('hex')
 if (!env.SESSION_SECRET) console.log('未配置 SESSION_SECRET：本地开发会话将在服务重启后失效。')
 const { db, dataDir, isPostgres } = await openDatabase(env)
-const requiredMigrations = ['001_initial.cjs', '002_team_collaboration.cjs', '003_research_knowledge.cjs']
 if (!isPostgres) await migrateDatabase(db)
-else if (!(await db.schema.hasTable('knex_migrations')) || (await db('knex_migrations').whereIn('name', requiredMigrations)).length < requiredMigrations.length) throw new Error('请先运行数据库迁移。')
+else if ((await migrationStatus(db)).pending.length) throw new Error('请先运行数据库迁移。')
 const storage = await createObjectStorage(dataDir, env)
 const PgStore = connectPg(session)
 const SqliteStore = connectSqlite(session)
-const pgPool = isPostgres ? new pg.Pool({ connectionString: env.DATABASE_URL }) : null
-const store = isPostgres ? new PgStore({ pool: pgPool, createTableIfMissing: false }) : new SqliteStore({ db: 'sessions.sqlite', dir: dataDir, concurrentDB: true })
+const pgPool = isPostgres ? new pg.Pool({ ...postgresConnection(env), max: 5 }) : null
+pgPool?.on('error', () => logEvent('session_database_unavailable'))
+const store = isPostgres ? new PgStore({ pool: pgPool, createTableIfMissing: false, errorLog: () => logEvent('session_store_unavailable') }) : new SqliteStore({ db: 'sessions.sqlite', dir: dataDir, concurrentDB: true })
+store.on('error', () => logEvent('session_store_unavailable'))
 const app = express()
-app.disable('x-powered-by')
-if (production) app.set('trust proxy', 1)
-app.use((req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.setHeader('Cache-Control', 'no-store')
-  if (!new Set([`127.0.0.1:${port}`, `localhost:${port}`]).has(req.get('host') || '')) return res.status(403).json({ error: '不允许的访问来源。' })
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !origins.has(req.get('origin') || '')) return res.status(403).json({ error: '不允许的请求来源。' })
-  next()
+let draining = false
+installHttpSecurity(app, config)
+app.get('/health/live', (req, res) => res.status(draining ? 503 : 200).json({ status: draining ? 'draining' : 'live' }))
+app.get(['/health/ready', '/api/health'], async (req, res) => {
+  if (draining) return res.status(503).json({ status: 'not_ready' })
+  try {
+    await Promise.all([db.raw('select 1').timeout(3000), pgPool?.query({ text: 'select 1 from session limit 0', query_timeout: 3000 }), storage.check()])
+    return res.json({ status: 'ready' })
+  } catch {
+    logEvent('readiness_failed', { requestId: req.requestId })
+    return res.status(503).json({ status: 'not_ready', requestId: req.requestId })
+  }
 })
+app.use((req, res, next) => draining ? res.status(503).json({ error: '服务正在重启，请稍后重试。' }) : next())
 app.use(session({ name: 'paperflow.sid', secret, store, resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: production, maxAge: 7 * 24 * 60 * 60 * 1000 } }))
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/ai/')) return next()
@@ -333,10 +338,10 @@ const providerConfig = readProviderConfig(env)
 async function cleanupObjects() {
   const jobs = await db('object_deletions').limit(20)
   for (const job of jobs) {
-    try { await storage.delete(job.storage_key); await db('object_deletions').where({ storage_key: job.storage_key }).delete() } catch { console.error('文件清理待重试。') }
+    try { await storage.delete(job.storage_key); await db('object_deletions').where({ storage_key: job.storage_key }).delete() } catch { logEvent('object_cleanup_pending') }
   }
 }
-void cleanupObjects().catch(() => console.error('文件清理待重试。'))
+const initialCleanup = cleanupObjects().catch(() => logEvent('object_cleanup_pending'))
 
 app.get('/api/workspaces/:id/papers', requireAuth, async (req, res) => {
   const membership = await workspaceMember(req.params.id, req.session.userId)
@@ -397,7 +402,7 @@ app.post('/api/papers', upload.single('file'), async (req, res) => {
     if (!member) return res.status(404).json({ error: '空间不存在或无权访问。' })
   }
   let pageCount
-  const task = getDocument({ data: new Uint8Array(file.buffer), disableFontFace: true })
+  const task = getDocument({ data: new Uint8Array(file.buffer), disableFontFace: true, enableXfa: false })
   try { pageCount = (await task.promise).numPages; if (!pageCount) throw new Error('empty') } catch { return res.status(400).json({ error: 'PDF 已损坏、受密码保护或无法解析。' }) } finally { await task.destroy() }
   const key = `${randomUUID()}.pdf`
   const timestamp = now()
@@ -611,11 +616,34 @@ app.delete('/api/summaries/:id', async (req, res) => {
   return res.status(204).end()
 })
 registerKnowledge(app, { db, requireAuth, workspaceMember, accessPaper })
+app.use((req, res) => res.status(404).json({ error: '接口不存在。', requestId: req.requestId }))
 app.use((error, req, res, next) => {
-  if (res.headersSent) return next(error)
-  if (error instanceof multer.MulterError || error.type === 'entity.too.large' || error instanceof SyntaxError) return res.status(400).json({ error: '请求格式错误或文件超过大小限制。' })
-  console.error('请求处理失败。')
-  return res.status(500).json({ error: '服务暂时不可用，请稍后重试。' })
+  const invalid = error instanceof multer.MulterError || error.type === 'entity.too.large' || error instanceof SyntaxError
+  logEvent(invalid ? 'invalid_request' : 'request_failed', { requestId: req.requestId })
+  if (res.headersSent) { res.destroy(); return }
+  return res.status(invalid ? 400 : 500).json({ error: invalid ? '请求格式错误或文件超过大小限制。' : '服务暂时不可用，请稍后重试。', requestId: req.requestId })
 })
 
-http.createServer(app).listen(port, '127.0.0.1', () => console.log(`PaperFlow API listening on 127.0.0.1:${port}; database=${isPostgres ? 'postgresql' : 'sqlite'}; storage=${storage.kind}.`))
+const server = http.createServer({ requestTimeout: 70000, headersTimeout: 15000, keepAliveTimeout: 5000 }, app)
+await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve) })
+console.log(`PaperFlow API listening on ${host}:${port}; database=${isPostgres ? 'postgresql' : 'sqlite'}; storage=${storage.kind}.`)
+async function shutdown() {
+  if (draining) return
+  draining = true
+  logEvent('shutdown_started')
+  const deadline = setTimeout(() => { server.closeAllConnections(); logEvent('shutdown_timeout'); process.exit(1) }, 15000)
+  deadline.unref()
+  try {
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    await initialCleanup
+    if (isPostgres) { await store.close(); await pgPool.end() }
+    else await new Promise((resolve, reject) => store.db.close(error => error ? reject(error) : resolve()))
+    await db.destroy()
+    storage.close()
+    clearTimeout(deadline)
+    logEvent('shutdown_complete')
+    process.exit(0)
+  } catch { logEvent('shutdown_failed'); process.exit(1) }
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)

@@ -1,3 +1,5 @@
+import { apiUrl } from './api'
+
 export type KnowledgeKind = 'question' | 'note' | 'record'
 export type KnowledgeStatus = 'open' | 'investigating' | 'resolved'
 export interface KnowledgeSource { workspaceId: string | null; paperId: string | null; annotationId: string | null; commentId: string | null }
@@ -18,7 +20,7 @@ export interface KnowledgeCard extends KnowledgeDraft {
 export const kindLabels: Record<KnowledgeKind, string> = { question: '研究问题', note: '科研笔记', record: '研究记录' }
 export const knowledgeStatusLabels: Record<KnowledgeStatus, string> = { open: '待研究', investigating: '研究中', resolved: '已整理' }
 async function request(path: string, init?: RequestInit) {
-  const response = await fetch(`/api/knowledge${path}`, { credentials: 'same-origin', ...init })
+  const response = await fetch(apiUrl(`/knowledge${path}`), { credentials: 'same-origin', ...init })
   if (response.status === 401) window.dispatchEvent(new Event('paperflow:session-expired'))
   if (!response.ok) { const data = await response.json().catch(() => ({})) as { error?: string }; throw new Error(data.error || '知识库请求失败。') }
   return response

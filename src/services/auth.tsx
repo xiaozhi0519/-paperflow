@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
 import { storageMode } from './libraryStore'
 import { clearRemoteCache } from './remoteLibrary'
+import { apiUrl } from './api'
 
 export interface Account { id: string; name: string; email: string }
 type AuthState = 'loading' | 'guest' | 'ready' | 'unavailable'
@@ -8,7 +9,7 @@ type AuthContextValue = { state: AuthState; user: Account | null; refresh: () =>
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 async function authRequest(path: string, method = 'GET', body?: unknown): Promise<Response> {
-  const response = await fetch(`/api/auth/${path}`, { method, credentials: 'same-origin', ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) })
+  const response = await fetch(apiUrl(`/auth/${path}`), { method, credentials: 'same-origin', ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) })
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string }
     throw new Error(data.error || '无法连接账号服务。')
@@ -23,7 +24,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (storageMode !== 'remote') return
     setState('loading')
     try {
-      const response = await fetch('/api/auth/me', { credentials: 'same-origin' })
+      const response = await fetch(apiUrl('/auth/me'), { credentials: 'same-origin' })
       if (response.status === 401) { clearRemoteCache(); setUser(null); setState('guest'); return }
       if (!response.ok) throw new Error('unavailable')
       setUser((await response.json() as { user: Account }).user); setState('ready')

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
@@ -12,11 +12,13 @@ const candidates = process.platform === 'win32' ? ['C:/Program Files/Google/Chro
 const executablePath = process.env.CHROME_PATH || candidates.find(existsSync)
 if (!executablePath) throw new Error('Set CHROME_PATH to an installed Chromium-compatible browser.')
 if (!existsSync('dist/index.html')) throw new Error('请先运行 npm run build，再执行本地导入浏览器测试。')
+const script = readFileSync('dist/index.html', 'utf8').match(/<script[^>]+src="([^"]+)"/)?.[1]
+assert.ok(script && !readFileSync(path.join('dist', script.replace(/^\//, '')), 'utf8').includes('/functions/v1/app/api'), '本导入夹具使用 /api，请先运行 npm run build，而不是 build:sites。')
 const webPort = await new Promise((resolve, reject) => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)) }); server.on('error', reject) })
 const apiPort = await new Promise((resolve, reject) => { const server = net.createServer(); server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)) }); server.on('error', reject) })
 const dataDir = await mkdtemp(path.join(os.tmpdir(), 'paperflow-import-test-'))
 const base = `http://127.0.0.1:${webPort}`
-const env = { ...process.env, NODE_ENV: 'development', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: '', AI_PORT: String(apiPort), AI_ALLOWED_ORIGINS: base, SESSION_SECRET: 'isolated-import-test-session-secret-long-enough' }
+const env = { ...process.env, NODE_ENV: 'development', DEPLOYMENT_MODE: 'same-origin', BIND_HOST: '127.0.0.1', VITE_API_BASE_URL: '/api', ALLOWED_HOSTS: `127.0.0.1:${apiPort},localhost:${apiPort}`, TRUSTED_PROXIES: '', PG_SSL_CA_FILE: '', S3_FORCE_PATH_STYLE: '', AI_BASE_URL: '', AI_MODEL: '', PAPERFLOW_DATA_DIR: dataDir, DATABASE_URL: '', S3_BUCKET: '', S3_REGION: '', S3_ENDPOINT: '', S3_ACCESS_KEY_ID: '', S3_SECRET_ACCESS_KEY: '', AI_API_KEY: '', AI_PORT: String(apiPort), AI_ALLOWED_ORIGINS: base, SESSION_SECRET: 'isolated-import-test-session-secret-long-enough' }
 let api
 let web
 const output = { api: '', web: '' }

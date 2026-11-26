@@ -1,3 +1,4 @@
+import { apiUrl } from './api'
 import type { Paper, ReadingProgress } from '../types/library'
 
 export type WorkspaceRole = 'owner' | 'member'
@@ -7,7 +8,7 @@ export interface WorkspaceDetail extends WorkspaceSummary { members: WorkspaceMe
 export interface WorkspacePaperItem { paper: Paper; progress: ReadingProgress; addedAt: string }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...init })
+  const response = await fetch(apiUrl(path), { credentials: 'same-origin', ...init })
   if (response.status === 401) window.dispatchEvent(new Event('paperflow:session-expired'))
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string }

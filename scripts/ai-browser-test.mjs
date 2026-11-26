@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright-core'
 import { PDFDocument } from 'pdf-lib'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
@@ -10,9 +11,71 @@ import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
 const candidates = process.platform === 'win32' ? ['C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'] : process.platform === 'darwin' ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'] : ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']
 const executablePath = process.env.CHROME_PATH || candidates.find(existsSync)
 if (!executablePath) throw new Error('Set CHROME_PATH to an installed Chromium-compatible browser.')
-const baseURL = process.env.PAPERFLOW_URL || 'http://127.0.0.1:5173'
+const root = fileURLToPath(new URL('../', import.meta.url))
+const baseURL = new URL(process.env.PAPERFLOW_URL || 'http://127.0.0.1:5173').origin
+assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(baseURL).hostname), 'Browser mocks must run against a loopback dev server')
+const models = ['gpt-6.1-sol', 'glm-5.3-flash']
+const mockAnswer = '这是测试桩返回的解释。'
+const unexpectedRequests = []
+// Register before navigation in EVERY context, including migration and mobile.
+// Never fall through to a developer's configured AI or remote library service.
+async function installAiMock(target) {
+  const state = { configured: false, outcome: 'success', expectedModel: models[0], requests: [] }
+  await target.route('**/*', async route => {
+    const request = route.request()
+    const url = new URL(request.url())
+    if (url.origin !== baseURL) { unexpectedRequests.push(url.href); await route.abort('blockedbyclient'); return }
+    if (url.pathname.endsWith('/ai/status') && request.method() === 'GET') {
+      await route.fulfill({ json: { configured: state.configured, model: state.configured ? models[0] : null, models } })
+      return
+    }
+    if (url.pathname.endsWith('/ai/answer') && request.method() === 'POST') {
+      assert.equal(state.configured, true, 'An unconfigured status must not issue model requests')
+      const body = request.postDataJSON()
+      assert.equal(body.model, state.expectedModel)
+      assert.ok(models.includes(body.model))
+      state.requests.push(body)
+      if (state.outcome === 'http-error') { await route.fulfill({ status: 503, json: { error: '模拟模型服务不可用' } }); return }
+      if (['explain', 'translate'].includes(body.mode)) assert.ok(body.selection)
+      const chunk = body.selection ? body.chunks.find(item => item.text.includes(body.selection)) : body.chunks[0]
+      assert.ok(chunk, 'Mock citations must come from the submitted sample evidence')
+      const result = { source: 'model', answer: mockAnswer, citations: [{ paperId: body.paperId, pageNumber: chunk.pageNumber, chunkId: chunk.chunkId, quote: body.selection || chunk.text.slice(0, 100) }], provider: { model: body.model, modelStatus: 'valid', usage: null, usageStatus: 'missing' } }
+      const events = state.outcome === 'success'
+        ? [{ type: 'delta', text: mockAnswer.slice(0, 7) }, { type: 'delta', text: mockAnswer.slice(7) }, { type: 'done', result }]
+        : [{ type: 'delta', text: `不可保存的模拟草稿 ${state.outcome}` }, ...(state.outcome === 'stream-error' ? [{ type: 'error', error: '模拟流式生成失败', code: 'UPSTREAM_ERROR' }] : [])]
+      await route.fulfill({ contentType: 'application/x-ndjson; charset=utf-8', body: events.map(event => JSON.stringify(event)).join('\n') + '\n' })
+      return
+    }
+    const staticFetch = url.protocol === 'blob:' || /^\/(?:@|src\/|node_modules\/|assets\/)/.test(url.pathname) || url.pathname === '/paperflow-sample.pdf'
+    if (request.method() !== 'GET' || /^\/(?:api|functions)(?:\/|$)/.test(url.pathname) || (['fetch', 'xhr'].includes(request.resourceType()) && !staticFetch)) {
+      unexpectedRequests.push(`${request.method()} ${url.href}`)
+      await route.fulfill({ status: 503, json: { error: 'Unmocked API request blocked by browser test' } })
+      return
+    }
+    await route.continue()
+  })
+  return state
+}
+async function storedAnswers(target) {
+  return target.evaluate(() => new Promise((resolve, reject) => {
+    const open = indexedDB.open('paperflow-library')
+    open.onerror = () => reject(open.error)
+    open.onsuccess = () => {
+      const db = open.result
+      const tx = db.transaction(['aiHistory', 'notes', 'annotations'])
+      const result = {}
+      for (const name of tx.objectStoreNames) {
+        const request = tx.objectStore(name).getAll()
+        request.onsuccess = () => { result[name] = request.result }
+      }
+      tx.oncomplete = () => { db.close(); resolve(result) }
+      tx.onabort = () => { db.close(); reject(tx.error) }
+    }
+  }))
+}
 const browser = await chromium.launch({ executablePath, headless: true })
-const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, serviceWorkers: 'block' })
+const mock = await installAiMock(context)
 const page = await context.newPage()
 const errors = []
 page.on('pageerror', error => errors.push(error.message))
@@ -36,8 +99,10 @@ async function chunks() {
   }))
 }
 try {
-  const migration = await browser.newContext()
+  const migration = await browser.newContext({ serviceWorkers: 'block' })
+  await installAiMock(migration)
   const oldPage = await migration.newPage()
+  oldPage.on('pageerror', error => errors.push(error.message))
   await oldPage.goto(`${baseURL}/pdf-lab`, { waitUntil: 'networkidle' })
   await oldPage.evaluate(() => new Promise((resolve, reject) => {
     const open = indexedDB.open('paperflow-library', 1)
@@ -70,7 +135,7 @@ try {
   console.log('IndexedDB v1-to-v2 migration preserved papers, files, progress, annotations and notes.')
 
   await page.goto(`${baseURL}/library`, { waitUntil: 'networkidle' })
-  await page.locator('input[type=file]').setInputFiles(path.resolve('public/paperflow-sample.pdf'))
+  await page.locator('input[type=file]').setInputFiles(path.join(root, 'public/paperflow-sample.pdf'))
   await page.getByRole('status').filter({ hasText: '已保存到本地文献库' }).waitFor({ timeout: 30000 })
   await page.getByRole('link', { name: '开始阅读' }).click()
   await page.locator('.textLayer span', { hasText: 'Research grows through small' }).waitFor({ state: 'attached', timeout: 30000 })
@@ -103,20 +168,32 @@ try {
   assert.equal(await page.locator('.page-counter').innerText(), '2 / 2')
   await page.getByRole('status').filter({ hasText: /引用页|原文/ }).waitFor()
 
-  await page.route('**/api/ai/status', route => route.fulfill({ json: { configured: true, model: 'test-stub' } }))
-  await page.route('**/api/ai/answer', async route => {
-    const body = route.request().postDataJSON()
-    assert.ok(body.selection && body.chunks.some(chunk => chunk.text.includes(body.selection)))
-    const chunk = body.chunks.find(item => item.text.includes(body.selection))
-    await route.fulfill({ json: { source: 'model', answer: '这是测试桩返回的解释。', citations: [{ paperId: body.paperId, pageNumber: chunk.pageNumber, chunkId: chunk.chunkId, quote: body.selection }] } })
-  })
+  assert.equal(mock.requests.length, 0, 'The absent-AI demo and no-evidence path must stay local')
+  mock.configured = true
   await page.getByRole('button', { name: '上一页' }).click()
   await waitForRender()
+  // Remount the panel so it reads the explicitly mocked configured status.
   await page.getByRole('tab', { name: '高亮与笔记' }).click()
+  await page.getByRole('tab', { name: 'AI 助手' }).click()
+  const selector = page.getByRole('combobox', { name: '选择 AI 模型' })
+  await selector.waitFor()
+  await selector.locator(`option[value="${models[1]}"]`).waitFor({ state: 'attached' })
+  assert.equal(await selector.inputValue(), models[0])
+  assert.deepEqual(await selector.locator('option').evaluateAll(options => options.map(option => option.value)), models)
+  mock.expectedModel = models[1]
+  await selector.selectOption(models[1])
   await dragSelection()
   await page.getByRole('toolbar', { name: '选段 AI 操作' }).getByRole('button', { name: '翻译', exact: true }).click()
-  await page.getByText('这是测试桩返回的解释。').waitFor()
-  await page.getByRole('button', { name: '保存回答为笔记' }).click()
+  const modelMessage = page.locator('.ai-message--assistant').filter({ hasText: mockAnswer })
+  await modelMessage.waitFor()
+  await page.getByRole('button', { name: '停止生成', exact: true }).waitFor({ state: 'hidden' })
+  assert.equal(mock.requests.length, 1)
+  assert.equal(mock.requests[0].model, models[1])
+  assert.equal(mock.requests[0].mode, 'translate')
+  assert.ok(mock.requests[0].selection)
+  assert.equal(await modelMessage.locator('.citation-card span').innerText(), `“${mock.requests[0].selection}”`)
+  assert.equal(await page.locator('.ai-message').filter({ hasText: '生成中 · 引用待校验' }).count(), 0)
+  await modelMessage.getByRole('button', { name: '保存回答为笔记' }).click()
   await page.getByText('回答与选区已保存为高亮笔记。').waitFor()
   await page.getByRole('tab', { name: '高亮与笔记' }).click()
   await page.locator('.saved-item__text').first().click()
@@ -124,12 +201,31 @@ try {
   await page.screenshot({ path: path.join(os.tmpdir(), 'paperflow-ai-note.png'), fullPage: true })
   await page.reload({ waitUntil: 'networkidle' })
   await page.getByRole('tab', { name: 'AI 助手' }).click()
-  await page.getByText('这是测试桩返回的解释。').waitFor()
-  await page.unroute('**/api/ai/answer')
-  await page.route('**/api/ai/answer', route => route.fulfill({ status: 503, json: { error: '模拟模型服务不可用' } }))
-  await page.getByRole('textbox', { name: '向论文提问' }).fill('Research')
-  await page.getByRole('button', { name: '发送问题' }).click()
-  await page.getByRole('alert').filter({ hasText: '模拟模型服务不可用' }).waitFor()
+  await page.getByText(mockAnswer, { exact: true }).waitFor()
+  mock.expectedModel = models[0]
+  await selector.selectOption(models[0])
+  const beforeFailures = await storedAnswers(page)
+  for (const outcome of ['truncated', 'stream-error', 'http-error']) {
+    mock.outcome = outcome
+    await page.getByRole('textbox', { name: '向论文提问' }).fill(`Research ${outcome}`)
+    const received = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/ai/answer') && response.request().method() === 'POST')
+    await page.getByRole('button', { name: '发送问题' }).click()
+    await (await received).finished()
+    const alert = page.getByRole('alert')
+    await alert.waitFor()
+    await page.getByRole('button', { name: '停止生成', exact: true }).waitFor({ state: 'hidden' })
+    if (outcome === 'stream-error') assert.match(await alert.innerText(), /模拟流式生成失败/)
+    if (outcome === 'http-error') assert.match(await alert.innerText(), /模拟模型服务不可用/)
+    assert.equal(await page.locator('.ai-message').filter({ hasText: '生成中 · 引用待校验' }).count(), 0)
+    assert.equal((await page.locator('body').innerText()).includes('不可保存的模拟草稿'), false)
+    assert.equal(await selector.isEnabled(), true)
+    assert.deepEqual(await storedAnswers(page), beforeFailures, 'Failed NDJSON responses must not persist partial answers or notes')
+  }
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.getByRole('tab', { name: 'AI 助手' }).click()
+  await page.getByText(mockAnswer, { exact: true }).waitFor()
+  assert.equal((await page.locator('body').innerText()).includes('不可保存的模拟草稿'), false)
+  assert.deepEqual(await storedAnswers(page), beforeFailures)
   await page.goto(`${baseURL}/library`)
   await page.getByRole('button', { name: '删除 paperflow-sample' }).click()
   await page.getByRole('dialog').getByRole('button', { name: '确认删除' }).click()
@@ -137,7 +233,9 @@ try {
   assert.equal((await chunks()).length, 0)
   const historyCount = await page.evaluate(() => new Promise(resolve => { const open = indexedDB.open('paperflow-library'); open.onsuccess = () => { const request = open.result.transaction('aiHistory').objectStore('aiHistory').count(); request.onsuccess = () => resolve(request.result) } }))
   assert.equal(historyCount, 0)
-  await page.unrouteAll({ behavior: 'wait' })
+  // Keep the API deny-by-default routes installed for blank/private-PDF regressions too.
+  mock.configured = false
+  mock.outcome = 'success'
   const blank = await PDFDocument.create()
   blank.addPage([612, 792])
   await page.locator('input[type=file]').setInputFiles({ name: 'no-text.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await blank.save()) })
@@ -150,8 +248,9 @@ try {
   await page.getByRole('button', { name: '删除 no-text' }).click()
   await page.getByRole('dialog').getByRole('button', { name: '确认删除' }).click()
   await page.getByText('还没有文献').waitFor()
-  if (existsSync(path.resolve('Qoder.pdf'))) {
-    await page.locator('input[type=file]').setInputFiles(path.resolve('Qoder.pdf'))
+  // Never inspect or upload a private root document in the normal sample-only suite.
+  if (process.env.PAPERFLOW_TEST_PRIVATE_PDF === '1' && existsSync(path.join(root, 'Qoder.pdf'))) {
+    await page.locator('input[type=file]').setInputFiles(path.join(root, 'Qoder.pdf'))
     await page.getByRole('status').filter({ hasText: '已保存到本地文献库' }).waitFor({ timeout: 60000 })
     await page.getByRole('link', { name: '开始阅读' }).click()
     await page.locator('.pdf-page canvas').waitFor({ timeout: 30000 })
@@ -162,7 +261,7 @@ try {
     const originalChunks = await chunks()
     assert.ok(originalChunks.length > 0)
     assert.ok(originalChunks.every(chunk => chunk.pageNumber >= 1 && chunk.pageNumber <= 25 && chunk.text && chunk.chunkId && chunk.paperId))
-    const originalPdf = await getDocument({ data: new Uint8Array(await readFile('Qoder.pdf')), disableFontFace: true }).promise
+    const originalPdf = await getDocument({ data: new Uint8Array(await readFile(path.join(root, 'Qoder.pdf'))), disableFontFace: true }).promise
     const cards = page.locator('.citation-card')
     for (let i = 0; i < await cards.count(); i++) {
       const card = cards.nth(i)
@@ -179,20 +278,41 @@ try {
     console.log(`Original Chinese PDF: extracted ${originalChunks.length} local chunks; displayed quotes match independently extracted source pages.`)
   }
   assert.deepEqual(errors, [])
-  console.log('AI reader: local demo, selection, no-evidence, verified citation jump, history, mock model note, failure and cascade deletion passed.')
+  console.log('AI reader: absent-AI demo, selection, no-evidence, verified citation jump, history, exact model choices, NDJSON model note, truncated/error responses and cascade deletion passed with intercepted APIs.')
 
-  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true })
+  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, serviceWorkers: 'block' })
+  const mobileMock = await installAiMock(mobile)
   const mobilePage = await mobile.newPage()
+  mobilePage.on('pageerror', error => errors.push(error.message))
   await mobilePage.goto(`${baseURL}/library`, { waitUntil: 'networkidle' })
-  await mobilePage.locator('input[type=file]').setInputFiles(path.resolve('public/paperflow-sample.pdf'))
+  await mobilePage.locator('input[type=file]').setInputFiles(path.join(root, 'public/paperflow-sample.pdf'))
   await mobilePage.getByRole('status').filter({ hasText: '已保存到本地文献库' }).waitFor({ timeout: 30000 })
   await mobilePage.getByRole('link', { name: '开始阅读' }).click()
   await mobilePage.getByRole('tab', { name: 'AI 助手' }).click()
   await mobilePage.getByRole('button', { name: '论文整体解读' }).click()
   await mobilePage.getByText('本地检索演示 · 非 AI').waitFor({ timeout: 30000 })
+  assert.equal(mobileMock.requests.length, 0)
+  const demoOverflow = await mobilePage.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }))
+  assert.equal(demoOverflow.scroll, demoOverflow.width)
+  mobileMock.configured = true
+  await mobilePage.getByRole('tab', { name: '高亮与笔记' }).click()
+  await mobilePage.getByRole('tab', { name: 'AI 助手' }).click()
+  const mobileSelector = mobilePage.getByRole('combobox', { name: '选择 AI 模型' })
+  await mobileSelector.waitFor()
+  await mobileSelector.locator(`option[value="${models[1]}"]`).waitFor({ state: 'attached' })
+  assert.equal(await mobileSelector.inputValue(), models[0])
+  assert.deepEqual(await mobileSelector.locator('option').evaluateAll(options => options.map(option => option.value)), models)
+  mobileMock.expectedModel = models[1]
+  await mobileSelector.selectOption(models[1])
+  await mobilePage.getByRole('button', { name: '论文整体解读' }).click()
+  await mobilePage.getByText(mockAnswer, { exact: true }).waitFor()
+  await mobilePage.getByRole('button', { name: '停止生成', exact: true }).waitFor({ state: 'hidden' })
+  assert.equal(mobileMock.requests.at(-1).model, models[1])
   const overflow = await mobilePage.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }))
   assert.equal(overflow.scroll, overflow.width)
   await mobilePage.screenshot({ path: path.join(os.tmpdir(), 'paperflow-ai-mobile.png'), fullPage: true })
   await mobile.close()
-  console.log('Mobile AI panel passed. Screenshots in the system temp directory.')
+  assert.deepEqual(errors, [])
+  assert.deepEqual(unexpectedRequests, [])
+  console.log('Mobile AI model selector and overflow passed. Screenshots are in the system temp directory. No real provider latency or compatibility was measured.')
 } finally { await browser.close() }

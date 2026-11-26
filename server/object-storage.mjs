@@ -1,8 +1,8 @@
 import path from 'node:path'
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { access, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 
-export async function createObjectStorage(dataDir, env = process.env) {
+export function readStorageConfig(env = process.env) {
   const bucket = env.S3_BUCKET?.trim() || ''
   const region = env.S3_REGION?.trim() || ''
   const accessKeyId = env.S3_ACCESS_KEY_ID?.trim() || ''
@@ -13,15 +13,23 @@ export async function createObjectStorage(dataDir, env = process.env) {
   if (env.NODE_ENV === 'production' && !configured) throw new Error('生产模式必须配置私有对象存储。')
   if (endpoint) {
     const url = new URL(endpoint)
-    if (!((url.protocol === 'https:') || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) || url.username || url.password || url.search || url.hash) throw new Error('对象存储地址不合法。')
+    if (!(url.protocol === 'https:' || (env.NODE_ENV !== 'production' && url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname))) || url.username || url.password || url.search || url.hash) throw new Error('对象存储地址不合法。')
   }
+  if (env.S3_FORCE_PATH_STYLE && !['true', 'false'].includes(env.S3_FORCE_PATH_STYLE)) throw new Error('S3_FORCE_PATH_STYLE 不合法。')
+  return { configured, bucket, region, accessKeyId, secretAccessKey, endpoint, forcePathStyle: env.S3_FORCE_PATH_STYLE ? env.S3_FORCE_PATH_STYLE === 'true' : Boolean(endpoint) }
+}
+
+export async function createObjectStorage(dataDir, env = process.env) {
+  const { configured, bucket, region, accessKeyId, secretAccessKey, endpoint, forcePathStyle } = readStorageConfig(env)
   if (configured) {
-    const client = new S3Client({ region, ...(endpoint ? { endpoint, forcePathStyle: true } : {}), credentials: { accessKeyId, secretAccessKey } })
+    const client = new S3Client({ region, ...(endpoint ? { endpoint } : {}), forcePathStyle, credentials: { accessKeyId, secretAccessKey } })
     return {
       kind: 's3',
-      async put(key, data) { await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: data, ContentType: 'application/pdf' })) },
-      async get(key) { const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key })); return Buffer.from(await result.Body.transformToByteArray()) },
-      async delete(key) { await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })) },
+      async check() { await client.send(new HeadBucketCommand({ Bucket: bucket }), { abortSignal: AbortSignal.timeout(3000) }) },
+      async put(key, data) { await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: data, ContentType: 'application/pdf' }), { abortSignal: AbortSignal.timeout(60000) }) },
+      async get(key) { const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: AbortSignal.timeout(60000) }); return Buffer.from(await result.Body.transformToByteArray()) },
+      async delete(key) { await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: AbortSignal.timeout(10000) }) },
+      close() { client.destroy() },
     }
   }
   const directory = path.join(dataDir, 'pdf')
@@ -32,8 +40,10 @@ export async function createObjectStorage(dataDir, env = process.env) {
   }
   return {
     kind: 'local',
+    async check() { await access(directory) },
     async put(key, data) { await writeFile(location(key), data, { flag: 'wx', mode: 0o600 }) },
     async get(key) { return readFile(location(key)) },
     async delete(key) { try { await unlink(location(key)) } catch (error) { if (error.code !== 'ENOENT') throw error } },
+    close() {},
   }
 }

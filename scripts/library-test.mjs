@@ -15,12 +15,32 @@ const browser = await chromium.launch({ executablePath, headless: true })
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
 const page = await context.newPage()
 const errors = []
+const dialogs = []
+page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.dismiss() })
 page.on('pageerror', error => errors.push(error.message))
 page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
 const input = page.locator('input[type=file]')
 const waitForRender = () => page.waitForFunction(() => !document.querySelector('.pdf-rendering'))
 
 try {
+  if (process.env.PAPERFLOW_TEST_PREVIEW === '1') {
+    const probe = await context.newPage()
+    try {
+      await probe.goto(`${baseURL}/library`, { waitUntil: 'networkidle' })
+      const policy = await probe.locator('meta[http-equiv="Content-Security-Policy"]').getAttribute('content')
+      assert.match(policy, /script-src 'self'/)
+      assert.ok(!policy.includes("'unsafe-inline'") && !policy.includes("'unsafe-eval'"))
+      const executed = await probe.evaluate(() => {
+        const script = document.createElement('script')
+        script.textContent = 'globalThis.paperflowInlineExecuted = true'
+        document.head.append(script)
+        script.remove()
+        return globalThis.paperflowInlineExecuted === true
+      })
+      assert.equal(executed, false)
+      console.log('Production CSP: inline JavaScript blocked in a real browser.')
+    } finally { await probe.close() }
+  }
   await page.goto(`${baseURL}/library`, { waitUntil: 'networkidle' })
   await page.getByText('还没有文献').waitFor()
   await input.setInputFiles({ name: 'not-pdf.txt', mimeType: 'text/plain', buffer: Buffer.from('hello') })
@@ -167,10 +187,14 @@ try {
   await page.goto(`${baseURL}/library`)
   const blank = await PDFDocument.create()
   blank.addPage([612, 792])
+  blank.addJavaScript('paperflow-security-probe', 'globalThis.paperflowPdfScriptExecuted = true; app.alert("paperflow-pdf-script")')
   await input.setInputFiles({ name: 'scan-like.pdf', mimeType: 'application/pdf', buffer: Buffer.from(await blank.save()) })
   await page.getByRole('status').filter({ hasText: '已保存到本地文献库' }).waitFor()
   await page.getByRole('link', { name: '开始阅读' }).click()
   await page.getByText('此页没有可选择的文本层', { exact: false }).waitFor({ timeout: 30000 })
+  assert.equal(await page.evaluate(() => globalThis.paperflowPdfScriptExecuted), undefined)
+  assert.deepEqual(dialogs, [])
+  console.log('PDF safety: document JavaScript remained inactive; canvas-only page rendered.')
   await page.goto(`${baseURL}/library`)
   await page.getByRole('button', { name: '删除 scan-like' }).click()
   await page.getByRole('dialog').getByRole('button', { name: '确认删除' }).click()

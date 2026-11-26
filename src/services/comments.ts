@@ -1,3 +1,5 @@
+import { apiUrl } from './api'
+
 export interface CommentAuthor { id: string; name: string }
 export interface DiscussionComment {
   id: string
@@ -13,7 +15,7 @@ export interface DiscussionComment {
 export interface CommentDraft { content: string; parentId?: string; annotationId?: string; workspaceId?: string | null }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
-  const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...init })
+  const response = await fetch(apiUrl(path), { credentials: 'same-origin', ...init })
   if (response.status === 401) window.dispatchEvent(new Event('paperflow:session-expired'))
   if (!response.ok) {
     const data = await response.json().catch(() => ({})) as { error?: string }
